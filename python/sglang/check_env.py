@@ -42,7 +42,7 @@ PACKAGE_LIST = [
     "pyzmq",
     "torchao",
     "uvicorn",
-    "uvloop",
+    "winloop" if sys.platform == "win32" else "uvloop",
     "vllm",
     "xgrammar",
     "openai",

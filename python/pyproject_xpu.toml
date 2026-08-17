@@ -68,7 +68,8 @@ dependencies = [
   "transformers==5.12.1",
   "uvicorn",
   "xxhash",
-  "uvloop",
+  "uvloop ; sys_platform != 'win32'",
+  "winloop>=0.6.3 ; sys_platform == 'win32'",
   # "xgrammar==0.2.1", xgrammar depends on CUDA PyTorch and Triton only
 ]
 
