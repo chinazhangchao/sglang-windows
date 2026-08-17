@@ -34,7 +34,6 @@ import pickle
 import platform
 import random
 import re
-import resource
 import shutil
 import signal
 import subprocess
@@ -76,6 +75,9 @@ from typing import (
 from unittest import SkipTest
 from unittest.case import _ShouldStop
 from urllib.parse import unquote, urlparse
+
+if os.name != "nt":
+    import resource
 
 import numpy as np
 import orjson
@@ -2146,6 +2148,9 @@ def monkey_patch_p2p_access_check():
 
 
 def set_ulimit(target_soft_limit=65535):
+    if os.name == "nt":
+        return
+
     # number of open files
     resource_type = resource.RLIMIT_NOFILE
     current_soft, current_hard = resource.getrlimit(resource_type)
