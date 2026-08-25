@@ -183,7 +183,6 @@ if _is_cuda:
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
-    if is_flashinfer_available():
     from flashinfer import bmm_fp8 as _raw_bmm_fp8_batched
 
     @register_custom_op(op_name="flashinfer_bmm_fp8_batched", mutates_args=["out"])
