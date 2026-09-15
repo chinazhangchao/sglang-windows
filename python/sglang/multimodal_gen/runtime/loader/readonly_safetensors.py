@@ -18,6 +18,7 @@ import json
 import mmap
 import os
 import struct
+import sys
 import warnings
 from typing import Iterator
 
@@ -50,7 +51,15 @@ def _mapping(path: str) -> mmap.mmap:
         fd = os.open(real, os.O_RDONLY)
         try:
             size = os.fstat(fd).st_size
-            mapped = mmap.mmap(fd, size, prot=mmap.PROT_READ, flags=mmap.MAP_PRIVATE)
+            if sys.platform == "win32":
+                mapped = mmap.mmap(fd, size, access=mmap.ACCESS_READ)
+            else:
+                mapped = mmap.mmap(
+                    fd,
+                    size,
+                    prot=mmap.PROT_READ,
+                    flags=mmap.MAP_PRIVATE,
+                )
         finally:
             os.close(fd)
         _MAPPINGS[real] = mapped

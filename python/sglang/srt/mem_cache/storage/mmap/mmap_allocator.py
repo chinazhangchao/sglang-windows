@@ -5,6 +5,8 @@ import logging
 import math
 import mmap
 import os
+import sys
+import tempfile
 import uuid
 import weakref
 
@@ -14,25 +16,27 @@ from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
-# Load libc once at module level so munmap is callable safely at GC/shutdown time.
-# Resolve the SONAME via find_library so the allocator also works on systems
-# whose libc is not named "libc.so.6" (e.g. musl / Alpine).
-try:
-    _libc_name = ctypes.util.find_library("c") or "libc.so.6"
-    _libc = ctypes.CDLL(_libc_name, use_errno=True)
-    _libc.mmap.restype = ctypes.c_void_p
-    _libc.mmap.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_size_t,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_long,
-    ]
-    _libc.munmap.restype = ctypes.c_int
-    _libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-except OSError:
+if sys.platform == "win32":
     _libc = None
+else:
+    # Load libc once at module level so munmap is callable safely at
+    # GC/shutdown time.
+    try:
+        _libc_name = ctypes.util.find_library("c") or "libc.so.6"
+        _libc = ctypes.CDLL(_libc_name, use_errno=True)
+        _libc.mmap.restype = ctypes.c_void_p
+        _libc.mmap.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_long,
+        ]
+        _libc.munmap.restype = ctypes.c_int
+        _libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    except OSError:
+        _libc = None
 
 # MAP_POPULATE is in Python's mmap module only since 3.11.
 _MAP_POPULATE = getattr(mmap, "MAP_POPULATE", 0x08000)
@@ -42,7 +46,6 @@ _MAP_HUGE_2MB = 21 << 26  # 0x1400000
 _MAP_HUGE_1GB = 30 << 26  # 0x78000000
 _MAP_FAILED = ctypes.c_void_p(-1).value
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
-_PROT_RW = mmap.PROT_READ | mmap.PROT_WRITE
 
 
 @functools.cache
@@ -52,12 +55,14 @@ def _has_madv_populate_write() -> bool:
     Probed once on a single page. Probing on the real allocation is not an
     option: the answer decides how that allocation gets pre-faulted.
     """
+    if sys.platform == "win32":
+        return False
     try:
         probe = mmap.mmap(
             -1,
             mmap.PAGESIZE,
             flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
-            prot=_PROT_RW,
+            prot=mmap.PROT_READ | mmap.PROT_WRITE,
         )
     except OSError:
         return False
@@ -70,21 +75,29 @@ def _has_madv_populate_write() -> bool:
         probe.close()
 
 
-def _mmap_prefaulted(fileno: int, alloc_bytes: int, flags: int) -> mmap.mmap:
+def _mmap_prefaulted(
+    fileno: int, alloc_bytes: int, flags: int | None = None
+) -> mmap.mmap:
     """mmap `alloc_bytes` with every page already faulted in and writable.
 
     cudaHostRegister has to pin real, pre-faulted pages, so these mappings can
-    never be handed back lazily. MAP_POPULATE and MADV_POPULATE_WRITE each give
-    that guarantee on their own, but asking for both makes the kernel walk the
-    whole mapping twice. Prefer the madvise, which additionally reports a
-    failure (e.g. ENOMEM) instead of leaving pages quietly unpopulated, and fall
-    back to MAP_POPULATE only where the kernel lacks it.
+    never be handed back lazily. On Windows, touching the writable mapping
+    commits every page. On POSIX, prefer MADV_POPULATE_WRITE, which reports
+    failures, and fall back to MAP_POPULATE where the kernel lacks it.
     """
+    if sys.platform == "win32":
+        mm = mmap.mmap(fileno, alloc_bytes, access=mmap.ACCESS_WRITE)
+        ctypes.memset(ctypes.addressof(ctypes.c_char.from_buffer(mm)), 0, alloc_bytes)
+        return mm
+
+    if flags is None:
+        raise ValueError("POSIX mmap flags are required")
+    prot_rw = mmap.PROT_READ | mmap.PROT_WRITE
     if _has_madv_populate_write():
-        mm = mmap.mmap(fileno, alloc_bytes, flags=flags, prot=_PROT_RW)
+        mm = mmap.mmap(fileno, alloc_bytes, flags=flags, prot=prot_rw)
         mm.madvise(_MADV_POPULATE_WRITE)
         return mm
-    return mmap.mmap(fileno, alloc_bytes, flags=flags | _MAP_POPULATE, prot=_PROT_RW)
+    return mmap.mmap(fileno, alloc_bytes, flags=flags | _MAP_POPULATE, prot=prot_rw)
 
 
 def _alloc_hugepage(n_bytes: int, alloc_bytes: int, extra_flags: int) -> ctypes.Array:
@@ -93,6 +106,8 @@ def _alloc_hugepage(n_bytes: int, alloc_bytes: int, extra_flags: int) -> ctypes.
     munmap fires automatically via weakref.finalize when the array is
     garbage-collected (i.e. when the tensor that wraps it is freed).
     """
+    if sys.platform == "win32" or _libc is None:
+        raise RuntimeError("POSIX hugepage mmap is unavailable on Windows")
     ptr = _libc.mmap(
         None,
         alloc_bytes,
@@ -112,9 +127,8 @@ def _alloc_hugepage(n_bytes: int, alloc_bytes: int, extra_flags: int) -> ctypes.
 def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     """Allocate a host tensor via anonymous mmap. Set SGLANG_HUGEPAGE_SIZE=2MB or 1GB for hugepages.
 
-    MAP_SHARED + MAP_POPULATE are both required so cudaHostRegister pins real,
-    pre-faulted physical pages (otherwise pinning can race with COW or page
-    faults and the device ends up reading stale data).
+    The mapping is explicitly pre-faulted so cudaHostRegister pins real physical
+    pages rather than racing with copy-on-write or lazy page faults.
 
     The tensor owns the mapping; munmap fires when the tensor is freed.
     """
@@ -142,7 +156,7 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     if extra_flags:
         if _libc is None:
             logger.error(
-                "Hugepage mmap requested but libc.so.6 could not be loaded; "
+                "Hugepage mmap requested but POSIX libc is unavailable; "
                 "falling back to plain mmap. SGLANG_HUGEPAGE_SIZE=%s will be ignored.",
                 hugepage_size,
             )
@@ -164,12 +178,15 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     # Plain mmap path -- used directly when no hugepages requested, or as fallback.
     # torch.frombuffer keeps a reference to mm inside the tensor storage, so mm
     # stays alive until the tensor is freed and mmap.mmap.__del__ calls munmap.
-    mm = _mmap_prefaulted(-1, alloc_bytes, mmap.MAP_SHARED | mmap.MAP_ANONYMOUS)
+    if sys.platform == "win32":
+        mm = _mmap_prefaulted(-1, alloc_bytes)
+    else:
+        mm = _mmap_prefaulted(-1, alloc_bytes, mmap.MAP_SHARED | mmap.MAP_ANONYMOUS)
     return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
 
 
 def alloc_shm(dims: tuple, dtype: torch.dtype) -> tuple[torch.Tensor, int, mmap.mmap]:
-    """Allocate a host tensor via shared memory (/dev/shm).
+    """Allocate a host tensor via file-backed shared memory.
 
     Returns a tuple of (tensor, fd, mm).
     The caller is responsible for keeping the fd open if they need to share it,
@@ -189,29 +206,42 @@ def alloc_shm(dims: tuple, dtype: torch.dtype) -> tuple[torch.Tensor, int, mmap.
     page_size = mmap.PAGESIZE
     alloc_bytes = math.ceil(n_bytes / page_size) * page_size
 
-    # Create an anonymous shared memory file descriptor via memfd_create
+    # Create a shared memory file descriptor. Windows has no memfd_create or
+    # unlink-while-open semantics, so TemporaryFile supplies delete-on-close.
     fd = None
-    try:
-        # MFD_CLOEXEC is standard on Linux 3.17+
-        fd = os.memfd_create(
-            f"sglang_host_pool_{uuid.uuid4().hex}",
-            flags=getattr(os, "MFD_CLOEXEC", 1),
+    if sys.platform == "win32":
+        temporary_file = tempfile.TemporaryFile(
+            prefix=f"sglang_host_pool_{uuid.uuid4().hex}_"
         )
-    except (AttributeError, OSError):
-        # Fallback to creating a file in /dev/shm if memfd_create is not supported
-        shm_path = f"/dev/shm/sglang_host_pool_{uuid.uuid4().hex}.mmap"
         try:
-            fd = os.open(shm_path, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o600)
+            fd = os.dup(temporary_file.fileno())
+        finally:
+            temporary_file.close()
+    else:
+        try:
+            # MFD_CLOEXEC is standard on Linux 3.17+
+            fd = os.memfd_create(
+                f"sglang_host_pool_{uuid.uuid4().hex}",
+                flags=getattr(os, "MFD_CLOEXEC", 1),
+            )
+        except (AttributeError, OSError):
+            # Fallback to creating a file in /dev/shm if memfd_create is not supported
+            shm_path = f"/dev/shm/sglang_host_pool_{uuid.uuid4().hex}.mmap"
             try:
-                os.unlink(shm_path)
-            except OSError:
-                pass
-        except Exception as e:
-            raise OSError(f"Failed to create shm file: {e}")
+                fd = os.open(shm_path, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o600)
+                try:
+                    os.unlink(shm_path)
+                except OSError:
+                    pass
+            except Exception as e:
+                raise OSError(f"Failed to create shm file: {e}")
 
     try:
         os.ftruncate(fd, alloc_bytes)
-        mm = _mmap_prefaulted(fd, alloc_bytes, mmap.MAP_SHARED)
+        if sys.platform == "win32":
+            mm = _mmap_prefaulted(fd, alloc_bytes)
+        else:
+            mm = _mmap_prefaulted(fd, alloc_bytes, mmap.MAP_SHARED)
     except Exception as e:
         if fd is not None:
             os.close(fd)

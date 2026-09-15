@@ -2,24 +2,24 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-import sys
-
-sys.modules["libtpu"] = None
 import ctypes
 import ctypes.util
 import mmap
 import os
+import sys
 import unittest
 import unittest.mock
 
 import torch
 
-from sglang.srt.mem_cache.pool_host.common import ShmHostTensorAllocator
-from sglang.srt.mem_cache.storage.mmap import alloc_mmap, alloc_shm
-from sglang.srt.mem_cache.storage.mmap.mmap_allocator import _mmap_prefaulted
+with unittest.mock.patch.dict(sys.modules, {"libtpu": None}):
+    from sglang.srt.mem_cache.pool_host.common import ShmHostTensorAllocator
+    from sglang.srt.mem_cache.storage.mmap import alloc_mmap, alloc_shm
+    from sglang.srt.mem_cache.storage.mmap.mmap_allocator import _mmap_prefaulted
+    from sglang.test.test_utils import CustomTestCase
 
 
-class TestMmapAllocator(unittest.TestCase):
+class TestMmapAllocator(CustomTestCase):
     def test_alloc_mmap(self):
         dims = (10, 1024)
         dtype = torch.float32
@@ -72,6 +72,16 @@ class TestMmapAllocator(unittest.TestCase):
         registration lets the device read memory that is not backed yet.
         """
         alloc_bytes = 64 * mmap.PAGESIZE
+        if sys.platform == "win32":
+            mm = _mmap_prefaulted(-1, alloc_bytes)
+            try:
+                self.assertEqual(mm[:: mmap.PAGESIZE], bytes(64))
+                mm[0] = 42
+                self.assertEqual(mm[0], 42)
+            finally:
+                mm.close()
+            return
+
         flags = mmap.MAP_SHARED | mmap.MAP_ANONYMOUS
 
         with self.subTest(path="madvise"):
