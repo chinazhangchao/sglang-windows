@@ -4,8 +4,12 @@
 # (hf_transformers_patches, lang.api, ...), which pull in torch and
 # FlashInfer: those claim these cache dirs early, and the first value set is
 # the one that sticks. Safe here -- environ has no heavy dependency (no torch).
-from sglang.srt.environ import redirect_third_party_caches
+from sglang.srt.environ import (
+    configure_flashinfer_jit_compiler,
+    redirect_third_party_caches,
+)
 
+configure_flashinfer_jit_compiler()
 redirect_third_party_caches()
 
 # Install stubs early for platforms where certain dependencies are unavailable

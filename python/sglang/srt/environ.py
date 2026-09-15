@@ -2,6 +2,7 @@ import functools
 import json
 import os
 import subprocess
+import sys
 import warnings
 from contextlib import ExitStack, contextmanager
 from enum import IntEnum
@@ -1547,6 +1548,18 @@ def redirect_third_party_caches():
     """
     for key, value in third_party_cache_defaults().items():
         os.environ.setdefault(key, value)
+
+
+def configure_flashinfer_jit_compiler():
+    """Apply the host-compiler mode required by FlashInfer's CuTe headers."""
+    if sys.platform != "win32":
+        return
+
+    env_name = "FLASHINFER_EXTRA_CUDAFLAGS"
+    required_flag = "-Xcompiler=/permissive"
+    current = os.environ.get(env_name, "")
+    if required_flag not in current.split():
+        os.environ[env_name] = f"{current} {required_flag}".strip()
 
 
 def _convert_SGL_to_SGLANG():
