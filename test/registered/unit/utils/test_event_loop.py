@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.utils import event_loop as event_loop_module
 from sglang.srt.utils.event_loop import (
     EVENT_LOOP_CONFIG,
     install_event_loop,
@@ -34,12 +35,14 @@ class TestEventLoop(CustomTestCase):
         policy = backend.EventLoopPolicy.return_value
 
         with (
-            patch(
-                "sglang.srt.utils.event_loop.importlib.import_module",
+            patch.object(
+                event_loop_module.importlib,
+                "import_module",
                 return_value=backend,
             ) as import_module,
-            patch(
-                "sglang.srt.utils.event_loop.asyncio.set_event_loop_policy"
+            patch.object(
+                event_loop_module.asyncio,
+                "set_event_loop_policy",
             ) as set_policy,
         ):
             install_event_loop()
@@ -53,8 +56,9 @@ class TestEventLoop(CustomTestCase):
         result = object()
         backend.run.return_value = result
 
-        with patch(
-            "sglang.srt.utils.event_loop.importlib.import_module",
+        with patch.object(
+            event_loop_module.importlib,
+            "import_module",
             return_value=backend,
         ) as import_module:
             self.assertIs(run_event_loop(main), result)
