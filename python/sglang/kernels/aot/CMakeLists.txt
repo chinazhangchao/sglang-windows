@@ -24,8 +24,6 @@ set(DEFAULT_SGL_KERNEL_BUILD_INFLLM ON)
 set(DEFAULT_SGL_KERNEL_BUILD_SPATIAL ON)
 set(DEFAULT_SGL_KERNEL_BUILD_FLASHMLA ON)
 set(DEFAULT_SGL_KERNEL_INSTALL_TRITON_KERNELS ON)
-set(DEFAULT_SGL_KERNEL_ENABLE_SPARSE_FLASH_ATTN ON)
-set(DEFAULT_SGL_KERNEL_ENABLE_CUTLASS_MLA ON)
 set(DEFAULT_SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS ON)
 if(WIN32)
     set(DEFAULT_SGL_KERNEL_BUILD_SM90 OFF)
@@ -33,8 +31,6 @@ if(WIN32)
     set(DEFAULT_SGL_KERNEL_BUILD_SPATIAL OFF)
     set(DEFAULT_SGL_KERNEL_BUILD_FLASHMLA OFF)
     set(DEFAULT_SGL_KERNEL_INSTALL_TRITON_KERNELS OFF)
-    set(DEFAULT_SGL_KERNEL_ENABLE_SPARSE_FLASH_ATTN OFF)
-    set(DEFAULT_SGL_KERNEL_ENABLE_CUTLASS_MLA OFF)
     set(DEFAULT_SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS OFF)
 endif()
 
@@ -44,18 +40,8 @@ option(SGL_KERNEL_BUILD_SPATIAL "Build the optional spatial extension" ${DEFAULT
 option(SGL_KERNEL_BUILD_FLASHMLA "Build the optional FlashMLA extension" ${DEFAULT_SGL_KERNEL_BUILD_FLASHMLA})
 option(SGL_KERNEL_INSTALL_TRITON_KERNELS "Bundle triton_kernels in the wheel" ${DEFAULT_SGL_KERNEL_INSTALL_TRITON_KERNELS})
 option(
-    SGL_KERNEL_ENABLE_SPARSE_FLASH_ATTN
-    "Build the sparse FlashAttention operators in common_ops"
-    ${DEFAULT_SGL_KERNEL_ENABLE_SPARSE_FLASH_ATTN}
-)
-option(
-    SGL_KERNEL_ENABLE_CUTLASS_MLA
-    "Build the AOT CUTLASS MLA decode operators"
-    ${DEFAULT_SGL_KERNEL_ENABLE_CUTLASS_MLA}
-)
-option(
     SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS
-    "Build optional CUTLASS, expert-specialization, AWQ, GPTQ, and legacy FP8 GEMM operators"
+    "Build optional expert-specialization, Mamba, MoE, and legacy FP8 GEMM operators"
     ${DEFAULT_SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS}
 )
 set(
@@ -392,7 +378,6 @@ endif()
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
     "csrc/attention/merge_attn_states.cu"
-    "csrc/attention/vertical_slash_index.cu"
     "csrc/common_extension.cc"
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/concat_mla.cu"
@@ -429,19 +414,13 @@ set(SOURCES
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
 )
 
-if(SGL_KERNEL_ENABLE_CUTLASS_MLA)
-    list(APPEND SOURCES "csrc/attention/cutlass_mla_kernel.cu")
-endif()
-
 if(SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS)
     list(APPEND SOURCES
         "csrc/expert_specialization/es_fp8_blockwise.cu"
         "csrc/expert_specialization/es_sm100_mxfp8_blockscaled.cu"
         "csrc/expert_specialization/es_sm100_mxfp8_blockscaled_group_quant.cu"
-        "csrc/gemm/awq_kernel.cu"
         "csrc/gemm/fp8_gemm_kernel.cu"
         "csrc/gemm/int8_gemm_kernel.cu"
-        "csrc/gemm/gptq/gptq_kernel.cu"
         "csrc/mamba/causal_conv1d.cu"
         "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
         "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
@@ -450,15 +429,6 @@ if(SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS)
     )
 endif()
 
-if(SGL_KERNEL_ENABLE_SPARSE_FLASH_ATTN)
-    list(APPEND SOURCES
-        "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_causal_sm80.cu"
-        "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_sm80.cu"
-        "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_causal_sm80.cu"
-        "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_sm80.cu"
-        "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
-    )
-endif()
 set(INCLUDES
     ${repo-cutlass_SOURCE_DIR}/include
     ${repo-cutlass_SOURCE_DIR}/tools/util/include
@@ -538,20 +508,6 @@ foreach(SGL_KERNEL_COMMON_TARGET IN LISTS SGL_KERNEL_COMMON_TARGETS)
         FLASHATTENTION_DISABLE_DROPOUT
         FLASHATTENTION_DISABLE_UNEVEN_K
     )
-    if(SGL_KERNEL_ENABLE_SPARSE_FLASH_ATTN)
-        target_compile_definitions(
-            ${SGL_KERNEL_COMMON_TARGET}
-            PRIVATE
-            SGL_KERNEL_ENABLE_SPARSE_FLASH_ATTN
-        )
-    endif()
-    if(SGL_KERNEL_ENABLE_CUTLASS_MLA)
-        target_compile_definitions(
-            ${SGL_KERNEL_COMMON_TARGET}
-            PRIVATE
-            SGL_KERNEL_ENABLE_CUTLASS_MLA
-        )
-    endif()
     if(SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS)
         target_compile_definitions(
             ${SGL_KERNEL_COMMON_TARGET}
