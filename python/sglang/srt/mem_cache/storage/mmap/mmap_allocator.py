@@ -4,6 +4,8 @@ import logging
 import math
 import mmap
 import os
+import sys
+import tempfile
 import uuid
 import weakref
 
@@ -13,25 +15,27 @@ from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
-# Load libc once at module level so munmap is callable safely at GC/shutdown time.
-# Resolve the SONAME via find_library so the allocator also works on systems
-# whose libc is not named "libc.so.6" (e.g. musl / Alpine).
-try:
-    _libc_name = ctypes.util.find_library("c") or "libc.so.6"
-    _libc = ctypes.CDLL(_libc_name, use_errno=True)
-    _libc.mmap.restype = ctypes.c_void_p
-    _libc.mmap.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_size_t,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_long,
-    ]
-    _libc.munmap.restype = ctypes.c_int
-    _libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-except OSError:
+if sys.platform == "win32":
     _libc = None
+else:
+    # Load libc once at module level so munmap is callable safely at
+    # GC/shutdown time.
+    try:
+        _libc_name = ctypes.util.find_library("c") or "libc.so.6"
+        _libc = ctypes.CDLL(_libc_name, use_errno=True)
+        _libc.mmap.restype = ctypes.c_void_p
+        _libc.mmap.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_long,
+        ]
+        _libc.munmap.restype = ctypes.c_int
+        _libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    except OSError:
+        _libc = None
 
 # MAP_POPULATE is in Python's mmap module only since 3.11.
 _MAP_POPULATE = getattr(mmap, "MAP_POPULATE", 0x08000)
@@ -49,6 +53,8 @@ def _alloc_hugepage(n_bytes: int, alloc_bytes: int, extra_flags: int) -> ctypes.
     munmap fires automatically via weakref.finalize when the array is
     garbage-collected (i.e. when the tensor that wraps it is freed).
     """
+    if sys.platform == "win32" or _libc is None:
+        raise RuntimeError("POSIX hugepage mmap is unavailable on Windows")
     ptr = _libc.mmap(
         None,
         alloc_bytes,
@@ -120,19 +126,23 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     # Plain mmap path -- used directly when no hugepages requested, or as fallback.
     # torch.frombuffer keeps a reference to mm inside the tensor storage, so mm
     # stays alive until the tensor is freed and mmap.mmap.__del__ calls munmap.
-    mm = mmap.mmap(
-        -1,
-        alloc_bytes,
-        flags=mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | _MAP_POPULATE,
-        prot=mmap.PROT_READ | mmap.PROT_WRITE,
-    )
-    try:
-        # MADV_POPULATE_WRITE guarantees pages are populated and writable,
-        # throwing an error on failure (e.g. out of memory).
-        mm.madvise(_MADV_POPULATE_WRITE)
-    except OSError:
-        # Fall back to MAP_POPULATE if MADV_POPULATE_WRITE is not supported (<5.14 kernel).
-        pass
+    if sys.platform == "win32":
+        mm = mmap.mmap(-1, alloc_bytes, access=mmap.ACCESS_WRITE)
+        ctypes.memset(ctypes.addressof(ctypes.c_char.from_buffer(mm)), 0, alloc_bytes)
+    else:
+        mm = mmap.mmap(
+            -1,
+            alloc_bytes,
+            flags=mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | _MAP_POPULATE,
+            prot=mmap.PROT_READ | mmap.PROT_WRITE,
+        )
+        try:
+            # MADV_POPULATE_WRITE guarantees pages are populated and writable,
+            # throwing an error on failure (e.g. out of memory).
+            mm.madvise(_MADV_POPULATE_WRITE)
+        except OSError:
+            # Fall back to MAP_POPULATE if MADV_POPULATE_WRITE is not supported (<5.14 kernel).
+            pass
     return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
 
 
@@ -157,41 +167,57 @@ def alloc_shm(dims: tuple, dtype: torch.dtype) -> tuple[torch.Tensor, int, mmap.
     page_size = mmap.PAGESIZE
     alloc_bytes = math.ceil(n_bytes / page_size) * page_size
 
-    # Create an anonymous shared memory file descriptor via memfd_create
+    # Create a shared memory file descriptor. Windows has no memfd_create or
+    # unlink-while-open semantics, so TemporaryFile supplies delete-on-close.
     fd = None
-    try:
-        # MFD_CLOEXEC is standard on Linux 3.17+
-        fd = os.memfd_create(
-            f"sglang_host_pool_{uuid.uuid4().hex}",
-            flags=getattr(os, "MFD_CLOEXEC", 1),
+    if sys.platform == "win32":
+        temporary_file = tempfile.TemporaryFile(
+            prefix=f"sglang_host_pool_{uuid.uuid4().hex}_"
         )
-    except (AttributeError, OSError):
-        # Fallback to creating a file in /dev/shm if memfd_create is not supported
-        shm_path = f"/dev/shm/sglang_host_pool_{uuid.uuid4().hex}.mmap"
         try:
-            fd = os.open(shm_path, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o600)
+            fd = os.dup(temporary_file.fileno())
+        finally:
+            temporary_file.close()
+    else:
+        try:
+            # MFD_CLOEXEC is standard on Linux 3.17+
+            fd = os.memfd_create(
+                f"sglang_host_pool_{uuid.uuid4().hex}",
+                flags=getattr(os, "MFD_CLOEXEC", 1),
+            )
+        except (AttributeError, OSError):
+            # Fallback to creating a file in /dev/shm if memfd_create is not supported
+            shm_path = f"/dev/shm/sglang_host_pool_{uuid.uuid4().hex}.mmap"
             try:
-                os.unlink(shm_path)
-            except OSError:
-                pass
-        except Exception as e:
-            raise OSError(f"Failed to create shm file: {e}")
+                fd = os.open(shm_path, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o600)
+                try:
+                    os.unlink(shm_path)
+                except OSError:
+                    pass
+            except Exception as e:
+                raise OSError(f"Failed to create shm file: {e}")
 
     try:
         os.ftruncate(fd, alloc_bytes)
-        mm = mmap.mmap(
-            fd,
-            alloc_bytes,
-            flags=mmap.MAP_SHARED | _MAP_POPULATE,
-            prot=mmap.PROT_READ | mmap.PROT_WRITE,
-        )
-        try:
-            # MADV_POPULATE_WRITE guarantees pages are populated and writable,
-            # throwing an error on failure (e.g. out of memory).
-            mm.madvise(_MADV_POPULATE_WRITE)
-        except OSError:
-            # Fall back to MAP_POPULATE if MADV_POPULATE_WRITE is not supported (<5.14 kernel).
-            pass
+        if sys.platform == "win32":
+            mm = mmap.mmap(fd, alloc_bytes, access=mmap.ACCESS_WRITE)
+            ctypes.memset(
+                ctypes.addressof(ctypes.c_char.from_buffer(mm)), 0, alloc_bytes
+            )
+        else:
+            mm = mmap.mmap(
+                fd,
+                alloc_bytes,
+                flags=mmap.MAP_SHARED | _MAP_POPULATE,
+                prot=mmap.PROT_READ | mmap.PROT_WRITE,
+            )
+            try:
+                # MADV_POPULATE_WRITE guarantees pages are populated and writable,
+                # throwing an error on failure (e.g. out of memory).
+                mm.madvise(_MADV_POPULATE_WRITE)
+            except OSError:
+                # Fall back to MAP_POPULATE if MADV_POPULATE_WRITE is not supported (<5.14 kernel).
+                pass
     except Exception as e:
         if fd is not None:
             os.close(fd)

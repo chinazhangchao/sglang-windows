@@ -14,6 +14,7 @@ import mmap
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -53,6 +54,9 @@ _MAX_CUDA_VIDEO_CONVERSION_CHUNK_BYTES = 128 * 1024 * 1024
 _MAX_PARALLEL_CUDA_VIDEO_SAVES = 2
 _cuda_video_buffer_cache_lock = threading.Lock()
 _cached_cuda_video_buffer: "_CudaMemfdVideoBuffer | None" = None
+_IS_WINDOWS = sys.platform == "win32"
+_memfd_create = None if _IS_WINDOWS else getattr(os, "memfd_create", None)
+_sendfile = None if _IS_WINDOWS else getattr(os, "sendfile", None)
 
 
 class _CudaMemfdVideoBuffer:
@@ -68,7 +72,15 @@ class _CudaMemfdVideoBuffer:
         self._registered = False
 
         try:
-            self.fd = os.memfd_create(
+            if sys.platform == "win32":
+                raise RuntimeError(
+                    "Direct CUDA video buffers are unavailable on Windows"
+                )
+            if _memfd_create is None:
+                raise RuntimeError(
+                    "Direct CUDA video buffers require POSIX memfd_create"
+                )
+            self.fd = _memfd_create(
                 "sglang-video-frames",
                 flags=getattr(os, "MFD_CLOEXEC", 0),
             )
@@ -477,9 +489,13 @@ def _cuda_video_conversion_chunk_frames(video: torch.Tensor) -> int:
 
 
 def _sendfile_all(output_fd: int, input_fd: int, count: int) -> None:
+    if _IS_WINDOWS:
+        raise RuntimeError("Direct CUDA video streaming is unavailable on Windows")
+    if _sendfile is None:
+        raise RuntimeError("Direct CUDA video streaming requires POSIX sendfile")
     offset = 0
     while count:
-        sent = os.sendfile(output_fd, input_fd, offset, count)
+        sent = _sendfile(output_fd, input_fd, offset, count)
         if sent <= 0:
             raise RuntimeError("sendfile made no progress")
         offset += sent
@@ -495,7 +511,7 @@ def _try_save_cuda_video_direct(
     output_compression: Optional[int],
 ) -> bool:
     """Stream CUDA RGB chunks to ffmpeg through a registered memfd."""
-    if not hasattr(os, "memfd_create") or not hasattr(os, "sendfile"):
+    if _IS_WINDOWS or _memfd_create is None or _sendfile is None:
         return False
 
     sample_without_audio, audio = _split_sample_audio(sample)

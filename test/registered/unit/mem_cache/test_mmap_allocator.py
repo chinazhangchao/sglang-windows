@@ -16,6 +16,23 @@ from sglang.srt.mem_cache.storage.mmap import alloc_mmap, alloc_shm
 
 
 class TestMmapAllocator(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "win32", "Windows mmap compatibility")
+    def test_windows_allocators_without_posix_mmap_constants(self):
+        self.assertFalse(hasattr(mmap, "PROT_READ"))
+        self.assertFalse(hasattr(mmap, "MAP_SHARED"))
+
+        tensor = alloc_mmap((16,), torch.float32)
+        tensor.fill_(1)
+        self.assertTrue(torch.equal(tensor, torch.ones_like(tensor)))
+
+        tensor, fd, mm = alloc_shm((16,), torch.float32)
+        try:
+            tensor.fill_(2)
+            self.assertTrue(torch.equal(tensor, torch.full_like(tensor, 2)))
+        finally:
+            mm.close()
+            os.close(fd)
+
     def test_alloc_mmap(self):
         dims = (10, 1024)
         dtype = torch.float32
