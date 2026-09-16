@@ -114,6 +114,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+# Newer SGLang builds include quant_mode in cached TorchInductor calls.
 def _sglang_fp4_gemm_fake(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -122,7 +123,10 @@ def _sglang_fp4_gemm_fake(
     alpha: torch.Tensor,
     out_dtype: torch.dtype,
     out_features: int,
+    quant_mode: str = "w4a4",
 ) -> torch.Tensor:
+    if quant_mode != "w4a4":
+        raise ValueError(f"Unsupported FlashInfer FP4 GEMM quant mode: {quant_mode}")
     M = input.shape[-2]
     N = int(out_features)
     return input.new_empty((M, N), dtype=out_dtype)
@@ -137,7 +141,10 @@ def fp4_gemm(
     alpha: torch.Tensor,
     out_dtype: torch.dtype,
     out_features: int,
+    quant_mode: str = "w4a4",
 ) -> torch.Tensor:
+    if quant_mode != "w4a4":
+        raise ValueError(f"Unsupported FlashInfer FP4 GEMM quant mode: {quant_mode}")
     if not enable_flashinfer_fp4_gemm:
         raise RuntimeError(
             "NVFP4 GEMM requires flashinfer's mm_fp4; please install flashinfer."

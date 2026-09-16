@@ -2,22 +2,40 @@ import unittest
 from unittest.mock import patch
 
 import torch
-import torch.nn as nn
-
 from sglang.srt.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
 from sglang.srt.layers.parameter import PerTensorScaleParameter
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
+    fp4_gemm,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from torch import nn
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestModelOptNvfp4(CustomTestCase):
+    def test_fp4_gemm_accepts_cached_w4a4_quant_mode(self):
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        with FakeTensorMode():
+            output = fp4_gemm(
+                torch.empty((4, 8), dtype=torch.uint8),
+                torch.empty((8, 16), dtype=torch.uint8),
+                torch.empty((4, 1), dtype=torch.uint8),
+                torch.empty((1, 16), dtype=torch.uint8),
+                torch.empty((), dtype=torch.float32),
+                torch.bfloat16,
+                16,
+                quant_mode="w4a4",
+            )
+
+        self.assertEqual(output.shape, (4, 16))
+        self.assertEqual(output.dtype, torch.bfloat16)
+
     def _make_layer(self):
         return MergedColumnParallelLinear(
             input_size=16,
